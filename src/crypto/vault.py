@@ -24,11 +24,10 @@ KDF = {
     "hash_len": 32,
 }
 
-# Bounds applied to vault-header KDF params (crafted files cannot OOM the process).
 _KDF_TIME_MIN = 1
 _KDF_TIME_MAX = 10
-_KDF_MEMORY_MIN = 8_192  # KiB
-_KDF_MEMORY_MAX = 1_048_576  # KiB (1 GiB)
+_KDF_MEMORY_MIN = 8_192
+_KDF_MEMORY_MAX = 1_048_576
 _KDF_PARALLEL_MIN = 1
 _KDF_PARALLEL_MAX = 8
 _KDF_HASH_LEN = 32
@@ -63,10 +62,8 @@ def _clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
 
 
 def _sanitize_kdf_params(params: dict[str, Any] | None) -> dict[str, Any]:
-    """Allowlist and clamp KDF parameters from a vault header."""
     active = dict(KDF)
     if params:
-        # Only known keys; always force Argon2id + fixed hash length.
         if "time_cost" in params:
             active["time_cost"] = _clamp_int(
                 params["time_cost"], KDF["time_cost"], _KDF_TIME_MIN, _KDF_TIME_MAX
@@ -104,6 +101,31 @@ def _secure_chmod(path: Path, mode: int = 0o600) -> None:
         pass
 
 
+def parse_import_payload(raw: Any) -> list[dict[str, Any]]:
+    if isinstance(raw, dict) and "items" in raw:
+        if raw.get("redacted"):
+            raise VaultError(
+                "This file is a redacted export (passwords omitted) and cannot be imported."
+            )
+        rows = raw["items"]
+    elif isinstance(raw, list):
+        rows = raw
+    else:
+        raise VaultError('JSON must be a list of items or {"items": [...]}.')
+    if not isinstance(rows, list):
+        raise VaultError("Invalid items list.")
+    cleaned: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if row.get("_redacted"):
+            raise VaultError(
+                "This file is a redacted export (passwords omitted) and cannot be imported."
+            )
+        cleaned.append(row)
+    return cleaned
+
+
 @dataclass
 class SecretItem:
     id: str
@@ -113,6 +135,7 @@ class SecretItem:
     url: str = ""
     notes: str = ""
     tags: list[str] = field(default_factory=list)
+    folder: str = ""
     created: str = ""
     modified: str = ""
 
@@ -121,6 +144,15 @@ class SecretItem:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SecretItem":
+        if not isinstance(data, dict):
+            raise VaultError("Secret item is not an object.")
+        raw_tags = data.get("tags")
+        if isinstance(raw_tags, str):
+            tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
+        elif isinstance(raw_tags, (list, tuple, set)):
+            tags = [str(t).strip() for t in raw_tags if str(t).strip()]
+        else:
+            tags = []
         return cls(
             id=str(data.get("id") or secrets.token_hex(8)),
             title=str(data.get("title") or "Untitled"),
@@ -128,7 +160,8 @@ class SecretItem:
             password=str(data.get("password") or ""),
             url=str(data.get("url") or ""),
             notes=str(data.get("notes") or ""),
-            tags=list(data.get("tags") or []),
+            tags=tags,
+            folder=str(data.get("folder") or ""),
             created=str(data.get("created") or _now()),
             modified=str(data.get("modified") or _now()),
         )
@@ -158,19 +191,34 @@ class SecretsVault:
         if not self.path.exists():
             raise VaultError("Vault file does not exist.")
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            raw_text = self.path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise VaultError(f"Could not read vault file:\n{self.path}\n{exc}") from exc
+        try:
+            raw = json.loads(raw_text)
             header = raw["header"]
             payload = _unb64(raw["payload"])
             salt = _unb64(header["salt"])
             nonce = _unb64(header["nonce"])
-            kdf = _sanitize_kdf_params(header.get("kdf") if isinstance(header.get("kdf"), dict) else None)
+            kdf_raw = header.get("kdf")
+            kdf = _sanitize_kdf_params(kdf_raw if isinstance(kdf_raw, dict) else None)
             key = _derive_key(password, salt, kdf)
             plain = AESGCM(key).decrypt(nonce, payload, None)
             data = json.loads(plain.decode("utf-8"))
-            self.items = [SecretItem.from_dict(x) for x in data.get("items", [])]
+            raw_items = data.get("items") or []
+            if not isinstance(raw_items, list):
+                raise VaultError("Vault file is malformed.")
+            items = []
+            for entry in raw_items:
+                if not isinstance(entry, dict):
+                    raise VaultError("Vault file is malformed.")
+                items.append(SecretItem.from_dict(entry))
+            self.items = items
             self._password = password
         except InvalidTag as exc:
             raise InvalidPasswordError("Incorrect master password or corrupted vault.") from exc
+        except VaultError:
+            raise
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise VaultError("Vault file is malformed.") from exc
 
@@ -226,26 +274,31 @@ class SecretsVault:
         if last_error is not None:
             raise VaultError(f"Could not write vault file:\n{self.path}\n{last_error}") from last_error
 
-    def add_item(self, item: SecretItem) -> None:
+    def add_item(self, item: SecretItem, *, persist: bool = True) -> None:
         if not item.created:
             item.created = _now()
         item.modified = _now()
         if not item.id:
             item.id = secrets.token_hex(8)
         self.items.append(item)
-        self.save()
+        if persist:
+            self.save()
 
-    def update_item(self, item: SecretItem) -> None:
+    def update_item(self, item: SecretItem, *, persist: bool = True) -> None:
         item.modified = _now()
         for i, existing in enumerate(self.items):
             if existing.id == item.id:
                 self.items[i] = item
-                self.save()
+                if persist:
+                    self.save()
                 return
         raise VaultError("Secret not found.")
 
     def delete_item(self, item_id: str) -> None:
-        self.items = [x for x in self.items if x.id != item_id]
+        remaining = [x for x in self.items if x.id != item_id]
+        if len(remaining) == len(self.items):
+            raise VaultError("Secret not found.")
+        self.items = remaining
         self.save()
 
     def change_password(self, old_password: str, new_password: str) -> None:

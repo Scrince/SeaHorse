@@ -27,7 +27,6 @@ def main() -> int:
         str(ROOT / "build"),
         "--specpath",
         str(ROOT),
-                                                    
         "--hidden-import",
         "crypto.vault",
         "--hidden-import",

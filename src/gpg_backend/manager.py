@@ -25,6 +25,9 @@ class GpgKeyInfo:
     is_secret: bool
 
 
+_KEY_REF_RE = re.compile(r"^(?:0x)?[0-9A-Fa-f]{8,40}$")
+
+
 def _subprocess_kwargs() -> dict:
     kwargs: dict = {
         "capture_output": True,
@@ -33,7 +36,6 @@ def _subprocess_kwargs() -> dict:
         "errors": "replace",
     }
     if sys.platform == "win32":
-                                                                       
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         if flags:
             kwargs["creationflags"] = flags
@@ -89,7 +91,6 @@ class GpgManager:
             pass
 
     def _reload_agent(self) -> None:
-                                                                                
         if not self.gpg_path:
             return
         gpgconf = Path(self.gpg_path).with_name("gpgconf.exe")
@@ -113,6 +114,12 @@ class GpgManager:
         if self.gnupg_home is not None:
             env["GNUPGHOME"] = str(self.gnupg_home)
         return env
+
+    def _sanitize_key_ref(self, value: str) -> str:
+        text = (value or "").strip().replace(" ", "")
+        if not _KEY_REF_RE.fullmatch(text):
+            raise GpgError("Invalid key id or fingerprint.")
+        return text
 
     def _run(
         self,
@@ -171,6 +178,9 @@ class GpgManager:
             if tag in ("pub", "sec"):
                 if current:
                     keys.append(current)
+                if len(parts) < 7:
+                    current = None
+                    continue
                 algo = parts[3]
                 created = parts[5]
                 expires = parts[6]
@@ -187,18 +197,19 @@ class GpgManager:
                     is_secret=secret or tag == "sec",
                 )
             elif tag == "fpr" and current is not None:
-                current.fingerprint = parts[9]
+                if not current.fingerprint and len(parts) > 9:
+                    current.fingerprint = parts[9]
             elif tag == "uid" and current is not None:
-                uid = parts[9]
-                if uid:
-                    current.uids.append(uid)
+                if len(parts) > 9:
+                    uid = parts[9]
+                    if uid:
+                        current.uids.append(uid)
         if current:
             keys.append(current)
         return keys
 
     @staticmethod
     def _sanitize_batch_field(value: str, field_name: str, *, allow_empty: bool = False) -> str:
-        """Reject control characters / batch-directive injection in GnuPG param lines."""
         text = (value or "").strip()
         if not text:
             if allow_empty:
@@ -206,12 +217,8 @@ class GpgManager:
             raise GpgError(f"{field_name} is required.")
         if any(ord(ch) < 32 for ch in text) or "\x7f" in text:
             raise GpgError(f"{field_name} contains invalid control characters.")
-        if "\n" in text or "\r" in text or "\x00" in text:
-            raise GpgError(f"{field_name} must be a single line.")
-        # Percent starts GnuPG batch directives (%no-protection, %commit, …).
         if "%" in text:
             raise GpgError(f"{field_name} must not contain '%'.")
-        # Colons can confuse colon-delimited status output; block in identity fields.
         if field_name in {"Name", "Email"} and ":" in text:
             raise GpgError(f"{field_name} must not contain ':'.")
         if len(text) > 200:
@@ -241,7 +248,6 @@ class GpgManager:
         )
         expire_value = self._sanitize_expire(expire)
         if passphrase:
-            # Passphrase is still a batch field: block newlines / % injection.
             safe_pass = self._sanitize_batch_field(passphrase, "Passphrase")
             protection_lines = [f"Passphrase: {safe_pass}"]
         else:
@@ -294,13 +300,14 @@ class GpgManager:
         return keys[-1].fingerprint or keys[-1].key_id
 
     def export_public(self, fingerprint: str) -> str:
+        fingerprint = self._sanitize_key_ref(fingerprint)
         result = self._run(["--armor", "--export", fingerprint])
         if result.returncode != 0 or "BEGIN PGP PUBLIC KEY" not in result.stdout:
             raise GpgError(result.stderr.strip() or "Public export failed.")
         return result.stdout
 
     def export_secret(self, fingerprint: str) -> str:
-                                                                             
+        fingerprint = self._sanitize_key_ref(fingerprint)
         result = self._run(
             ["--armor", "--export-secret-keys", fingerprint],
             batch=False,
@@ -324,6 +331,7 @@ class GpgManager:
         return result.stderr.strip() or "Import completed."
 
     def delete_key(self, fingerprint: str, secret: bool = False) -> None:
+        fingerprint = self._sanitize_key_ref(fingerprint)
         if secret:
             result = self._run(["--delete-secret-and-public-key", fingerprint])
         else:
@@ -332,17 +340,15 @@ class GpgManager:
             raise GpgError(result.stderr.strip() or "Delete failed.")
 
     def encrypt_text(self, recipients: list[str], plaintext: str) -> str:
-                                                                                 
         args = ["--armor", "--trust-model", "always", "--encrypt"]
         for r in recipients:
-            args.extend(["--recipient", r])
+            args.extend(["--recipient", self._sanitize_key_ref(r)])
         result = self._run(args, input_text=plaintext)
         if result.returncode != 0 or "BEGIN PGP MESSAGE" not in (result.stdout or ""):
             raise GpgError(result.stderr.strip() or "Encryption failed.")
         return result.stdout
 
     def decrypt_text(self, ciphertext: str) -> str:
-                                                                              
         result = self._run(["--decrypt"], input_text=ciphertext, batch=False, timeout=300)
         if result.returncode != 0:
             raise GpgError(
