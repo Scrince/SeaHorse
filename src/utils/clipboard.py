@@ -5,8 +5,6 @@ from PyQt6.QtGui import QGuiApplication
 
 
 class ClipboardManager:
-    """Copy secrets to the clipboard and clear them after a short timeout."""
-
     def __init__(self, app: QGuiApplication) -> None:
         self._app = app
         self._timer = QTimer()
@@ -24,12 +22,10 @@ class ClipboardManager:
             self._pending_text = None
 
     def clear(self) -> None:
-        """Clear the clipboard if it still holds text we copied."""
         if self._pending_text is not None and self._app.clipboard().text() == self._pending_text:
             self._app.clipboard().clear()
         self._timer.stop()
         self._pending_text = None
 
     def flush(self) -> None:
-        """Stop the clear timer and remove any SeaHorse-copied text (e.g. on lock)."""
         self.clear()

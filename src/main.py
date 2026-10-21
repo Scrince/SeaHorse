@@ -4,6 +4,7 @@ import json
 import sys
 import traceback
 from pathlib import Path
+from typing import Any
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
@@ -23,8 +24,6 @@ if str(ROOT) not in sys.path:
 
 
 def _install_exception_hook() -> None:
-                                                                                
-
     def _hook(exc_type, exc, tb) -> None:
         details = "".join(traceback.format_exception(exc_type, exc, tb))
         try:
@@ -35,10 +34,11 @@ def _install_exception_hook() -> None:
             )
         except Exception:
             sys.__excepthook__(exc_type, exc, tb)
-                                                                       
+            return
         sys.__excepthook__(exc_type, exc, tb)
 
     sys.excepthook = _hook
+
 
 from crypto.vault import InvalidPasswordError, SecretsVault, VaultError
 from gpg_backend.manager import GpgManager
@@ -54,6 +54,8 @@ from utils.paths import (
 )
 from utils.themes import theme_stylesheet
 from version import APP_DISPLAY_NAME, APP_NAME, APP_VERSION
+
+DEFAULT_AUTO_LOCK_MINUTES = 10
 
 
 class UnlockDialog(QDialog):
@@ -108,35 +110,55 @@ class UnlockDialog(QDialog):
         super().accept()
 
 
-def load_theme_name() -> str:
+def load_settings() -> dict[str, Any]:
     path = settings_path()
+    defaults: dict[str, Any] = {
+        "theme": "light",
+        "auto_lock_minutes": DEFAULT_AUTO_LOCK_MINUTES,
+    }
+    if not path.exists():
+        return dict(defaults)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return dict(defaults)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return dict(defaults)
+    theme = str(data.get("theme", "light"))
+    if theme not in ("dark", "light"):
+        theme = "light"
+    try:
+        auto_lock = int(data.get("auto_lock_minutes", DEFAULT_AUTO_LOCK_MINUTES))
+    except (TypeError, ValueError):
+        auto_lock = DEFAULT_AUTO_LOCK_MINUTES
+    auto_lock = max(0, min(auto_lock, 24 * 60))
+    return {"theme": theme, "auto_lock_minutes": auto_lock}
+
+
+def save_settings(updates: dict[str, Any]) -> None:
+    path = settings_path()
+    data: dict[str, Any] = {}
     if path.exists():
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            name = str(data.get("theme", "light"))
-            return name if name in ("dark", "light") else "light"
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
         except (OSError, json.JSONDecodeError, TypeError):
-            return "light"
-    return "light"
+            data = {}
+    data.update(updates)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def load_theme_name() -> str:
+    return str(load_settings().get("theme", "light"))
 
 
 def save_theme_name(name: str) -> None:
-    path = settings_path()
-    data = {"theme": name}
-    if path.exists():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                data = {}
-        except (OSError, json.JSONDecodeError, TypeError):
-            data = {}
-    data["theme"] = name
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    save_settings({"theme": name})
 
 
 class SeaHorseApp:
     def __init__(self) -> None:
-                                                                                 
         try:
             QApplication.setHighDpiScaleFactorRoundingPolicy(
                 Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
@@ -149,7 +171,8 @@ class SeaHorseApp:
         self.qt.setApplicationVersion(APP_VERSION)
         self.qt.setOrganizationName("SeaHorse")
         try:
-            self.theme_name = load_theme_name()
+            self.settings = load_settings()
+            self.theme_name = str(self.settings.get("theme", "light"))
             self.qt.setStyleSheet(theme_stylesheet(self.theme_name))
             self.vault = SecretsVault(vault_path())
             self.gpg = GpgManager(portable_gnupg_home())
@@ -159,26 +182,36 @@ class SeaHorseApp:
             raise SystemExit(1) from exc
         self.window: MainWindow | None = None
 
+    def _persist_settings(self, updates: dict[str, Any]) -> None:
+        try:
+            save_settings(updates)
+            self.settings.update(updates)
+        except OSError:
+            pass
+
     def run(self) -> int:
         if not self.unlock_vault():
             return 0
         self.clipboard = ClipboardManager(self.qt)
+        auto_lock = int(self.settings.get("auto_lock_minutes", DEFAULT_AUTO_LOCK_MINUTES))
         self.window = MainWindow(
-            self.vault, self.gpg, self.ssh, self.theme_name, clipboard=self.clipboard
+            self.vault,
+            self.gpg,
+            self.ssh,
+            self.theme_name,
+            clipboard=self.clipboard,
+            auto_lock_minutes=auto_lock,
+            on_settings_changed=self._persist_settings,
         )
         original_set_theme = self.window.set_theme
 
         def set_theme_and_persist(name: str) -> None:
             original_set_theme(name)
             self.qt.setStyleSheet(theme_stylesheet(name))
-            try:
-                save_theme_name(name)
-            except OSError:
-                pass
+            self._persist_settings({"theme": name})
 
-        self.window.set_theme = set_theme_and_persist                               
+        self.window.set_theme = set_theme_and_persist
         self.window.show()
-                                                                                                
         missing = []
         if not self.gpg.available:
             missing.append("• GnuPG / Gpg4win — needed for OpenPGP keys")

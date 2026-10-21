@@ -46,8 +46,6 @@ class SshManager:
         self.ssh_keygen = shutil.which("ssh-keygen") or self._find_ssh_keygen()
 
     def _find_ssh_keygen(self) -> str | None:
-        import os
-
         system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
         candidates = [
             system_root / "System32" / "OpenSSH" / "ssh-keygen.exe",
@@ -67,7 +65,6 @@ class SshManager:
     def list_keys(self) -> list[SshKeyInfo]:
         keys: list[SshKeyInfo] = []
         for pub in sorted(self.ssh_dir.glob("*.pub")):
-                                          
             private = Path(str(pub)[:-4]) if str(pub).endswith(".pub") else pub.with_suffix("")
             info = self._inspect(pub, private)
             if info:
@@ -103,7 +100,7 @@ class SshManager:
         if self.ssh_keygen:
             try:
                 result = subprocess.run(
-                    [self.ssh_keygen, "-l", "-f", str(target)],
+                    [self.ssh_keygen, "-l", "-P", "", "-f", str(target)],
                     timeout=30,
                     check=False,
                     **_subprocess_kwargs(),
@@ -171,7 +168,6 @@ class SshManager:
         if key_type in ("rsa", "rsa1"):
             args.extend(["-b", str(bits)])
 
-        # Never put a non-empty passphrase on argv (visible via ps / audit logs).
         if not passphrase:
             args.extend(["-N", ""])
             result = subprocess.run(args, timeout=120, check=False, **_subprocess_kwargs())
@@ -196,7 +192,6 @@ class SshManager:
     def _run_keygen_with_askpass(
         self, args: list[str], passphrase: str
     ) -> subprocess.CompletedProcess[str]:
-        """Run ssh-keygen without -N; supply passphrase only via SSH_ASKPASS."""
         with tempfile.TemporaryDirectory(prefix="seahorse-askpass-") as tmp:
             tmp_path = Path(tmp)
             secret_file = tmp_path / "secret"
@@ -256,7 +251,6 @@ class SshManager:
         if private_text.strip():
             private_path.write_text(private_text.strip() + "\n", encoding="utf-8")
             try:
-                                                                                      
                 private_path.chmod(0o600)
             except OSError:
                 pass
@@ -265,9 +259,8 @@ class SshManager:
         if not private_text.strip() and not public_text.strip():
             raise SshError("Provide a private and/or public key.")
         if private_text.strip() and not public_text.strip() and self.ssh_keygen:
-                                                                                     
             result = subprocess.run(
-                [self.ssh_keygen, "-y", "-f", str(private_path)],
+                [self.ssh_keygen, "-y", "-P", "", "-f", str(private_path)],
                 timeout=30,
                 check=False,
                 **_subprocess_kwargs(),
